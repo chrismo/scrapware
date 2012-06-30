@@ -1,0 +1,232 @@
+Setting up a gem_server as a Windows Service
+============================================
+1) Install win32-service.  Be sure to use 0.4.3 or later.
+2) Create the 'C:\Program Files\GemServer' directory.  I refer to
+   this as the 'GemServer home directory' from now on.
+3) Create a GemServer controller program.  This will also be used to
+   install the service.  I called mine 'gemctl.rb'.  Put it somewhere in
+   your path, such as C:\ruby\bin.  It looks like this:
+
+###############################################
+# gemctl.rb
+#
+# Control script for the GemServer Service
+###############################################
+require "optparse"
+require "win32/service"
+include Win32
+
+gem_home = 'C:\Progra~1\GemServer'
+gem_prog = gem_home + '\gem_daemon.rb'
+
+gem_svc  = 'GemSvc'
+gem_name = 'Gem Server'
+
+OPTIONS = {}
+
+ARGV.options do |opts|
+   opts.on("-d", "--delete", "Delete the service"){ OPTIONS[:delete] = true }
+   opts.on("-s", "--start",  "Start the service"){ OPTIONS[:start] = true }
+   opts.on("-x", "--stop",   "Stop the service"){ OPTIONS[:stop] = true }
+   opts.on("-i", "--install","Install the service"){ OPTIONS[:install] = true }
+   opts.on("-h", "--help",   "Show this help message."){ puts opts; exit }
+   opts.parse!
+end
+
+# Install the service
+if OPTIONS[:install]  
+   svc = Service.new
+   svc.create_service{ |s|
+      s.service_name     = gem_svc
+      s.display_name     = gem_name
+      s.binary_path_name = 'c:\ruby\bin\rubyw ' + gem_prog
+   }
+   svc.close
+   puts "GemServer service installed"
+end
+
+# Start the service
+if OPTIONS[:start]
+   Service.start(gem_svc)
+   started = false
+   while started == false
+      s = Service.status(gem_svc)
+      started = true if s.current_state == "running"
+      break if started == true
+      puts "One moment, " + s.current_state
+      sleep 1
+   end
+   puts "GemServer service started"
+end
+
+# Stop the service
+if OPTIONS[:stop]
+   Service.stop(gem_svc)
+   stopped = false
+   while stopped == false
+      s = Service.status(gem_svc)
+      stopped = true if s.current_state == "stopped"
+      break if stopped == true
+      puts "One moment, " + s.current_state
+      sleep 1
+   end
+   puts "GemServer service stopped"
+end
+
+# Delete the service.  Stop it first.
+if OPTIONS[:delete]
+   begin
+      Service.stop(gem_svc)
+   rescue
+   end
+   Service.delete(gem_svc)
+   puts "GemServer service deleted"
+end
+# END gemctl.rb
+
+Note that I didn't include handlers for pause or resume.  You may add them
+if you wish.  Also note that you can control this service using the Services
+GUI that comes with Windows rather than using this script once the service
+is installed.
+
+4) Create an GemServer Daemon in the GemServer home directory.  It should
+look something like this:
+
+###################################################################
+# gem_daemon.rb
+#
+# Modified version of gem_server for use as a windows service
+###################################################################
+require 'rubygems'
+Gem.manage_gems
+require 'webrick'
+require 'yaml'
+require 'optparse'
+require 'rdoc/template'
+require 'win32/service'
+include Win32
+
+Socket.do_not_reverse_lookup = true
+
+DOC_TEMPLATE = <<-WEBPAGE
+      <?xml version="1.0" encoding="utf-8"?>
+      <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+      <html xmlns="http://www.w3.org/1999/xhtml">
+        <head>
+          <title>RubyGems Documentation Index</title>
+          <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+        </head>
+        <body>
+          <center>
+          <h1>RubyGems Documentation Index</h1>
+          <table border="2">
+            <tr>
+              <td align='center'><h3>Gem Name</h3></td>
+              <td align='center'><h3>Description</h3></td>
+              <td align='center'><h3>Documentation</h3></td>
+            </tr>
+START:specs
+            <tr><td>%full_name%</td>
+              <td>%summary%</td>
+              <td>
+IF:rdoc_installed
+                <a href="%doc_path%">RDoc Index</a>
+ENDIF:rdoc_installed
+IFNOT:rdoc_installed
+                None installed
+ENDIF:rdoc_installed
+              </td>
+            </tr>
+END:specs
+          </table>
+          </center>
+        </body>
+      </html>
+    WEBPAGE
+
+class GemDaemon < Daemon
+   HOME = 'C:\Progra~1\GemServer'
+   def initialize
+      @logfile = HOME + '\gemservice.log'
+      begin
+         @s = WEBrick::HTTPServer.new(:Port => 8808)
+      rescue Exception => e
+         File.open(@logfile,"w+"){ |f| f.puts "Error in initialize: #{e}" }
+         service_stop
+      end   
+   end
+   
+   def service_main
+      begin
+         @s.mount_proc("/yaml") { |req, res|
+            res['content-type'] = 'text/plain'
+            res.body << Gem::Cache.from_installed_gems(File.join(Gem.dir, "specifications")).to_yaml
+         }
+      rescue Exception => e
+         File.open(@logfile,'w+'){ |f| f.puts "Start failed: #{e}" }
+         service_stop
+      end
+      
+      begin
+         @s.mount_proc("/") { |req, res|
+            specs = []
+            specifications_dir = File.join(Gem.dir, "specifications")
+            Gem::Cache.from_installed_gems(specifications_dir).each do |path, spec|
+               specs << {
+                  "name"           => spec.name,
+                  "version"        => spec.version,
+                  "full_name"      => spec.full_name,
+                  "summary"        => spec.summary,
+                  "rdoc_installed" => Gem::DocManager.new(spec).rdoc_installed?,
+                  "doc_path"       => ('/doc_root/' + spec.full_name + '/rdoc/index.html')
+               }
+            end
+            specs = specs.sort_by { |spec| [spec["name"].downcase, spec["version"]] }
+            template = TemplatePage.new(DOC_TEMPLATE)
+            res['content-type'] = 'text/html'
+            template.write_html_on(res.body, {"specs" => specs})      
+         }
+      rescue Exception => e
+         File.open(@logfile,'w+'){ |f| f.puts "Start failed: #{e}" }
+         service_stop
+      end
+      
+      begin
+         {"/gems" => "/cache/", "/doc_root" => "/doc/"}.each do |mount_point, mount_dir|
+            @s.mount(mount_point, WEBrick::HTTPServlet::FileHandler, File.join(Gem.dir, mount_dir), true)
+         end
+      rescue Exception => e
+         File.open(@logfile,'w+'){ |f| f.puts "Start failed: #{e}" }
+         service_stop
+      end
+      
+      begin
+         @s.start
+      rescue Exception => e
+         File.open(@logfile,'w+'){ |f| f.puts "Start failed: #{e}" }
+         service_stop
+      end
+   end
+   
+   def service_stop
+      @s.shutdown if @s
+      exit
+   end
+end
+
+g = GemDaemon.new
+g.mainloop
+# END gem_daemon.rb
+
+You may define other service handlers as you see fit if you wish.  The
+above code should work fine as is, however.
+
+Also note that I hard coded some values.  You may wish to alter them to
+suit your own needs.
+
+5) Install the service by doing 'ruby gemctl -i'.  Assuming all goes well
+then type 'ruby gemctl -s'.  It should start.
+
+6) Start viewing the rdoc documentation!  If the service is running you
+should now be able to go to http://localhost:8808 and see any rdoc
+documentation that was installed by rubygems.

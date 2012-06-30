@@ -1,0 +1,15 @@
+#dilemma {
+}
+
+#title {
+    font-family: Arial, sans-serif;
+    text-align: center;
+    margin: auto;
+    width: 70%;
+}
+
+.door {
+    position: absolute;
+    background-color: black;
+}
+
